@@ -1,17 +1,45 @@
 from pathlib import Path
-from uuid import uuid4
 from astropy.io.fits import getheader
+from datetime import datetime
+import hashlib
 import shutil
 import re
 import logging
 import os
+import warnings
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
-logging.basicConfig(level=logging.DEBUG, filename="sorting_log.log",filemode="w", format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.WARNING, filename="sorting_log.log",filemode="w", format="%(asctime)s %(levelname)s %(message)s")
 
 # calibration files
 Calib_types = ("dark", "flat", "bias", "lamp")
+
+def is_protected_dir(name: str) -> bool:
+    name = name.lower()
+    return "calibration" in name or "targets" in name
+
+def get_header_date(file_path: Path):
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            header = getheader(file_path)
+        for key in ("DATE-OBS", "DATEOBS", "DATE"):
+            match = re.search(r"\d{4}-\d{2}-\d{2}", str(header.get(key, "")))
+            if match:
+                date_name = match.group(0)
+                datetime.strptime(date_name, "%Y-%m-%d")
+                return date_name
+    except Exception:
+        return None
+    return None
+
+def file_sha256(file_path: Path) -> str:
+    digest = hashlib.sha256()
+    with file_path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 # helper function to extract target directory dynamically
 # helper function to extract target directory dynamically
@@ -23,21 +51,39 @@ def get_target_dir(file_path: Path, file_type: str) -> Path:
             date_idx = i
             break
 
-    if date_idx == -1 or date_idx < 3:
-        return None
+    header_date = None
+    if file_path.suffix.lower() in (".fits", ".fit"):
+        header_date = get_header_date(file_path)
 
-    date_name = parts[date_idx]
-    year_name = date_name[:4]
+    if date_idx != -1 and date_idx >= 3:
+        date_name = header_date or parts[date_idx]
 
-    # Extract observatory, instrument, and mode dynamically from path
-    if re.fullmatch(r"\d{4}", parts[date_idx - 1]):
-        mode = parts[date_idx - 2]
-        inst = parts[date_idx - 3]
-        obs = parts[date_idx - 4]
+        # Extract observatory, instrument, and mode dynamically from path
+        if re.fullmatch(r"\d{4}", parts[date_idx - 1]):
+            mode = parts[date_idx - 2]
+            inst = parts[date_idx - 3]
+            obs = parts[date_idx - 4]
+        else:
+            mode = parts[date_idx - 1]
+            inst = parts[date_idx - 2]
+            obs = parts[date_idx - 3]
     else:
-        mode = parts[date_idx - 1]
-        inst = parts[date_idx - 2]
-        obs = parts[date_idx - 3]
+        if not header_date:
+            return None
+
+        year_idx = next(
+            (i for i, part in enumerate(parts) if re.fullmatch(r"\d{4}", part)),
+            -1,
+        )
+        if year_idx < 3:
+            return None
+
+        date_name = header_date
+        mode = parts[year_idx - 1]
+        inst = parts[year_idx - 2]
+        obs = parts[year_idx - 3]
+
+    year_name = date_name[:4]
 
     # Global storage architecture
     fai_base = Path("/observations") / obs / inst / mode
@@ -66,15 +112,19 @@ def get_target_dir(file_path: Path, file_type: str) -> Path:
 # function to get the required header from "fits" files
 def get_imagetype(fits_path: Path) -> str:
     try:
-        header = getheader(fits_path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            header = getheader(fits_path)
         return str(header.get("IMAGETYP", "")).lower()
     except Exception as e:
-        logging.debug(f"[Error] Failed to read {fits_path}: {e}")
-        return ""
+        logging.warning(f"[Error] Corrupted FITS left in place {fits_path}: {e}")
+        return None
 
 def get_masters_readoutm(fits_path: Path) -> str:
     try:
-        header = getheader(fits_path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            header = getheader(fits_path)
         readout = str(header.get("READOUTM", "")).lower()
 
         return (
@@ -90,6 +140,9 @@ def get_masters_readoutm(fits_path: Path) -> str:
 # function to determine the type of "fits" file: calibration and targets
 def classify_file(fits_path: Path) -> str:
     imagetyp = get_imagetype(fits_path)
+
+    if imagetyp is None:
+        return None
 
     for t in Calib_types:
         if t in imagetyp:
@@ -113,12 +166,24 @@ def move_non_fits_to_meta(folder: Path, meta_dir: Path):
         if dynamic_meta_dir:
             meta_dir = dynamic_meta_dir
 
+        if meta_dir is None:
+            logging.warning(f"[Error] Could not build meta path for: {folder}")
+            return
+
         meta_dir.mkdir(parents=True, exist_ok=True)
         end_d = meta_dir / folder.name
 
         # if the file already exists
         if end_d.exists():
-            end_d = (meta_dir / f"{folder.stem}_{uuid4().hex[:8]}{folder.suffix}")
+            if (folder.stat().st_size == end_d.stat().st_size and
+                    file_sha256(folder) == file_sha256(end_d)):
+                folder.unlink()
+            else:
+                logging.warning(
+                    f"[Error] Same meta name but different content; source left in place: "
+                    f"{folder} -> {end_d}"
+                )
+            return
 
         shutil.move(str(folder), str(end_d))
 
@@ -146,7 +211,9 @@ def scan_files(root_dir):
     fits_files = []
     meta_files = []
 
-    for dirpath, _, filenames in os.walk(root_dir):
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+
+        dirnames[:] = [d for d in dirnames if not is_protected_dir(d)]
 
         dirpath = Path(dirpath)
 
@@ -166,14 +233,16 @@ def scan_files(root_dir):
 def cleanup_empty_dirs(directory: Path):
     if not directory.exists():
         return
-    for root, dirs, _ in os.walk(directory, topdown=False):
-        for d in dirs:
-            dir_path = Path(root) / d
-            if not any(dir_path.iterdir()):
-                try:
-                    dir_path.rmdir()
-                except OSError:
-                    pass
+    directories = []
+    for root, dirs, _ in os.walk(directory, topdown=True):
+        dirs[:] = [d for d in dirs if not is_protected_dir(d)]
+        directories.extend(Path(root) / d for d in dirs)
+    for dir_path in reversed(directories):
+        if dir_path.exists() and not any(dir_path.iterdir()):
+            try:
+                dir_path.rmdir()
+            except OSError:
+                pass
     if not any(directory.iterdir()):
         try:
             directory.rmdir()
@@ -185,6 +254,10 @@ def process_directory(fits_path: Path):
 
     try:
         file_type = classify_file(fits_path)
+
+        if file_type is None:
+            return
+
         target_dir = get_target_dir(fits_path, file_type)
 
         if not target_dir:
@@ -196,12 +269,23 @@ def process_directory(fits_path: Path):
         target_path = target_dir / fits_path.name
 
         if target_path.exists():
+            try:
+                if (fits_path.stat().st_size == target_path.stat().st_size and
+                        file_sha256(fits_path) == file_sha256(target_path)):
+                    fits_path.unlink()
+                else:
+                    logging.warning(
+                        f"[Error] Same name but different content; source left in place: "
+                        f"{fits_path} -> {target_path}"
+                    )
+            except OSError as e:
+                logging.warning(f"[Error] Hash check failed for {fits_path}: {e}")
             return
 
         shutil.move(str(fits_path), str(target_path))
 
     except Exception as e:
-        print(f"[Error] moving error: {e}")
+        logging.error(f"[Error] moving error for {fits_path}: {e}")
 
     #move_non_fits_to_meta(Base_dir)
 
@@ -301,8 +385,8 @@ def process_telescope(telescope_path: Path):
 # |Execution block|
 
 if __name__ == "__main__":
-    # 1. Specifying the path to the night folder
-    base = Path(r"/observations/tshao/zeiss1000_east/ccd/2026/2026-05-15")
+    # 1. Specifying the path to the telescope archive
+    base = Path(r"/observations/tshao/zeiss1000_east/ccd")
     
     # 2. Scanning all files
     fits_files, meta_files = scan_files(base)
